@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build a single-file, server-less demo of the review app.
+"""Build a single-file, server-less demo of the board editor.
 
 The real front end (static/) runs unchanged on top of demo/mock.js, an
-in-browser stand-in for the Rust API. Usage:  python3 demo/build.py out.html
+in-browser stand-in for the Rust server and its live connection.
+Usage:  python3 demo/build.py out.html
 """
 import base64
-import json
 import re
 import sys
 from pathlib import Path
@@ -18,8 +18,8 @@ def read(path):
     return (ROOT / path).read_text(encoding="utf-8")
 
 
-def patch(src, old, new, count=1):
-    assert src.count(old) == count, f"expected {count}x: {old!r}"
+def patch(src, old, new):
+    assert src.count(old) == 1, f"expected once: {old!r}"
     return src.replace(old, new)
 
 
@@ -28,70 +28,46 @@ def body_of(html):
     return re.sub(r"<script.*?</script>", "", body, flags=re.S).strip()
 
 
-FILE_URL = re.compile(r"`/files/\$\{([^}]+)\}/(\w+)`")
-
-
-def view_source(path, patches):
-    src = read(path)
-    for old, new in patches:
-        src = patch(src, old, new)
-    src = FILE_URL.sub(r'demoFile(\1, "\2")', src)
-    assert "/files/" not in src and "location." not in src, path
-    return src
-
-
-board_js = view_source("static/board.js", [
-    ('const slug = decodeURIComponent(location.pathname.replace(/^\\/+|\\/+$/g, ""));',
-     "const slug = demoPath().slice(1);"),
-    ("location.reload();", "demoNavigate(demoPath());"),
-    # Downloads are blocked inside artifacts.
-    ('h("a.btn", { href: `/files/${version.id}/original`, download: "" }, "Download original"),', ""),
-])
-admin_js = view_source("static/admin.js", [
-    ("let publicUrl = location.origin;", 'let publicUrl = "https://review.betch.ch";'),
-    ('location.href = "/" + slug;', 'demoNavigate("/" + slug);'),
-])
-
-font = base64.b64encode((STATIC / "fonts/space-grotesk-latin-wght-normal.woff2").read_bytes()).decode()
-font_ext = base64.b64encode((STATIC / "fonts/space-grotesk-latin-ext-wght-normal.woff2").read_bytes()).decode()
-css = read("static/app.css")
-css = patch(css, "url(/static/space-grotesk.woff2)", f"url(data:font/woff2;base64,{font})")
-css = patch(css, "url(/static/space-grotesk-ext.woff2)", f"url(data:font/woff2;base64,{font_ext})")
-
-
 def script(code):
     return "<script>\n" + code.replace("</script", "<\\/script") + "\n</script>"
 
 
-sources = json.dumps({"board": board_js, "admin": admin_js}).replace("</", "<\\/")
+def font(name):
+    return base64.b64encode((STATIC / "fonts" / name).read_bytes()).decode()
 
-page = f"""<title>Betch Review Board</title>
+
+css = read("static/app.css")
+css = patch(css, "url(/static/space-grotesk.woff2)", f"url(data:font/woff2;base64,{font('space-grotesk-latin-wght-normal.woff2')})")
+css = patch(css, "url(/static/space-grotesk-ext.woff2)", f"url(data:font/woff2;base64,{font('space-grotesk-latin-ext-wght-normal.woff2')})")
+
+demo_bar = """
+<div id="demo-bar" class="ui" role="region" aria-label="Demo controls">
+  <span class="demo-tag">Demo</span>
+  <span class="demo-text">Runs in your browser. Your changes stay on this device.</span>
+  <label class="check"><input type="checkbox" id="demo-teammate" checked> Simulated teammate</label>
+  <button type="button" class="ghost" id="demo-reset">Reset board</button>
+</div>"""
+
+demo_wiring = """
+document.getElementById("demo-teammate").addEventListener("change", (e) => Demo.setTeammate(e.target.checked));
+document.getElementById("demo-reset").addEventListener("click", async () => {
+  if (await confirmDialog("Reset the demo board?", "Your changes are removed and the sample board comes back.", "Reset")) Demo.reset();
+});
+"""
+
+scripts = ['document.body.classList.add("board-page");', read("static/common.js")] + [read(f"static/board-{n}.js") for n in ("core", "render", "tools", "ui")]
+scripts += [read("demo/mock.js"), read("static/board-main.js"), demo_wiring]
+
+page = f"""<title>Betch Board</title>
 <meta name="robots" content="noindex">
 <style>
 {css}
+{read("static/board.css")}
 {read("demo/demo.css")}
 </style>
-<template id="tpl-board">
 {body_of(read("static/board.html"))}
-</template>
-<template id="tpl-admin">
-{body_of(read("static/admin.html"))}
-</template>
-<div id="demo-root"></div>
-<div id="demo-bar" role="region" aria-label="Demo controls">
-  <span class="demo-tag">Demo</span>
-  <div class="demo-seg" role="group" aria-label="View as">
-    <button type="button" data-role="admin">You (Betch)</button>
-    <button type="button" data-role="client">Client</button>
-  </div>
-  <select id="demo-board" aria-label="Board the client opens" hidden></select>
-  <span class="demo-hint" id="demo-hint"></span>
-  <button type="button" class="ghost" id="demo-reset" title="Restore the sample boards">Reset</button>
-</div>
-{script(read("static/common.js"))}
-<script>const VIEW_SOURCES = {sources};</script>
-{script(read("demo/mock.js"))}
-{script(read("demo/runtime.js"))}
+{demo_bar}
+{"".join(script(s) for s in scripts)}
 """
 
 out = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "demo/revo-demo.html")

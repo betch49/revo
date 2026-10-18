@@ -298,10 +298,15 @@ svg.it .cap { stroke: none; }
 .modal-backdrop .card { max-width: 440px; }
 
 @media (max-width: 720px) {
-  .bar-left { max-width: calc(100% - 170px); }
+  .bar { height: 44px; gap: 6px; }
+  .bar-left { max-width: calc(100% - 200px); padding-left: 8px; }
+  .bar-right { gap: 4px; }
+  #share-btn { padding: 6px 9px; }
+  #share-btn .label, .role-badge { display: none; }
   .bar-left .brand, .bar-left .bar-sep, .bar-link { display: none; }
   .title-btn { max-width: 150px; }
   .peers .avatar:nth-child(n + 3) { display: none; }
+  .title-btn { padding: 4px 6px; }
   .toolbar { top: auto; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); transform: none; flex-direction: row; max-width: calc(100% - 170px); overflow-x: auto; max-height: none; }
   .tb-sep { width: 1px; height: auto; margin: 6px 4px; }
   .zoombar #help-btn, .zoombar .bar-sep, .zoombar #zoom-fit { display: none; }

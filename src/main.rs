@@ -5,7 +5,7 @@ use revo::{AppState, app, auth::hash_password, config::Config, db::Db};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
-revo — Betch image review boards
+revo — Betch collaborative whiteboard
 
 USAGE:
     revo [serve]          Run the web server (configured with REVO_* environment variables)

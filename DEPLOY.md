@@ -132,6 +132,7 @@ Infomaniak notes that this applies to the site's primary domain. Keep
 ### A6. Check it
 - https://review.betch.ch/healthz shows `ok`
 - https://review.betch.ch/admin shows the sign-in page
+- **Live editing:** open a board in two browsers (one in a private window via a shared link). A sticky added in one should appear in the other within a second. This needs WebSockets to pass through Infomaniak's HAProxy. If the board shows "Reconnecting…" all the time, ask Infomaniak support to allow WebSocket upgrades (`Connection: Upgrade`) for `review.betch.ch`, or use route B.
 - Optional, from your own computer: `curl -m 5 http://SERVER-IP:4000/healthz` should **fail or time out**. Port 4000 shouldn't be reachable from outside; if it answers, ask Infomaniak support to block it.
 
 **Upload size:** if large uploads fail behind HAProxy or Apache but small ones
@@ -198,14 +199,15 @@ sites), then:
 systemctl reload caddy
 ```
 Once DNS points at the VPS, https://review.betch.ch works within a minute.
+Caddy passes WebSockets through automatically, so live editing needs no extra setup.
 
 ---
 
 ## First use
 1. Open https://review.betch.ch/admin and sign in.
-2. Create a board, for example *Atelier Lumen* with link `atelier-lumen` and an optional passcode. You land on the empty board.
-3. Drop images onto it or click **Upload**. Use **Arrange** to move and resize them.
-4. On the dashboard, use **Copy link** and send the link (plus the passcode, ideally by another channel) to your client.
+2. Create a board. It opens right away and starts **private**.
+3. Build on it: press `?` on the board for all tools and shortcuts.
+4. Click **Share**: choose who can open the link (view, comment or edit), optionally set a passcode, and copy the link.
 
 ## Updating the app
 Download the new binary (step 0), then:
@@ -220,7 +222,7 @@ The database schema is created and updated automatically on start. Boards,
 comments and images are kept.
 
 ## Backups
-Everything lives in the data folder (`~/revo/data`): `revo.db` and `images/`.
+Everything lives in the data folder (`~/revo/data`): `revo.db` (boards, items, comments) and `images/`.
 A daily copy, for example with `crontab -e` (Route A paths shown):
 ```cron
 15 3 * * * cd ~/revo && mkdir -p backups && rm -f backups/revo-$(date +\%u).db && REVO_DATA_DIR=data bin/revo backup backups/revo-$(date +\%u).db
@@ -235,4 +237,5 @@ Also copy `~/revo/data/images/` off the server now and then, for example to kDri
 | Service won't start | `journalctl --user -u revo -n 50` (Route A) or `journalctl -u revo -n 50` (Route B) |
 | 502 / 503 on the site | App not running, or the HAProxy port (Route A) or Caddy port (Route B) doesn't match `REVO_BIND` |
 | Can't sign in on http:// | Cookies are HTTPS-only by design; use the https:// address |
+| Board says "Reconnecting…" | WebSockets are blocked by the proxy: see A6 (Infomaniak) or check that Caddy is the one in front (VPS) |
 | Upload fails with "too large" | Raise `REVO_MAX_UPLOAD_MB` (and `max_size` in the Caddyfile on route B), then restart |

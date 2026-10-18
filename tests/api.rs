@@ -1,18 +1,21 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use axum::{
     Router,
     body::Body,
     http::{Request, StatusCode, header},
 };
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use revo::{AppState, app, auth::hash_password, config::Config, db::Db};
 use serde_json::{Value, json};
+use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 use tower::ServiceExt;
 
 const ADMIN_PASSWORD: &str = "correct horse battery";
 
 struct TestApp {
+    state: AppState,
     router: Router,
     data_dir: PathBuf,
 }
@@ -38,10 +41,10 @@ fn setup() -> TestApp {
         admin_password_hash: hash_password(ADMIN_PASSWORD).unwrap(),
         cookie_secure: true,
         max_upload_mb: 5,
-        public_url: "https://review.example".into(),
+        public_url: "https://boards.example".into(),
     };
     let state = AppState::new(Db::open_in_memory().unwrap(), config).unwrap();
-    TestApp { router: app(state), data_dir }
+    TestApp { router: app(state.clone()), state, data_dir }
 }
 
 impl TestApp {
@@ -70,35 +73,40 @@ impl TestApp {
         self.send(req.body(body).unwrap()).await
     }
 
-    async fn upload(&self, uri: &str, cookie: &str, files: &[(&str, Vec<u8>)]) -> Res {
+    async fn upload(&self, uri: &str, cookie: Option<&str>, name: &str, bytes: Vec<u8>) -> Res {
         let boundary = "revoTestBoundary";
-        let mut body = Vec::new();
-        for (name, bytes) in files {
-            body.extend_from_slice(
-                format!(
-                    "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-                )
-                .as_bytes(),
-            );
-            body.extend_from_slice(bytes);
-            body.extend_from_slice(b"\r\n");
-        }
-        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-        let req = Request::builder()
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(&bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut req = Request::builder()
             .method("POST")
             .uri(uri)
             .header("x-revo", "1")
-            .header(header::COOKIE, cookie)
-            .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
-            .body(Body::from(body))
-            .unwrap();
-        self.send(req).await
+            .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"));
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        self.send(req.body(Body::from(body)).unwrap()).await
     }
 
     async fn login(&self) -> String {
         let res = self.json("POST", "/api/admin/login", None, Some(json!({ "password": ADMIN_PASSWORD }))).await;
         assert_eq!(res.status, StatusCode::OK);
         res.cookie.expect("login sets a cookie")
+    }
+
+    async fn board(&self, admin: &str, title: &str) -> (i64, String) {
+        let res = self.json("POST", "/api/admin/boards", Some(admin), Some(json!({ "title": title }))).await;
+        assert_eq!(res.status, StatusCode::OK, "{:?}", res.json);
+        (res.json["id"].as_i64().unwrap(), res.json["slug"].as_str().unwrap().to_string())
+    }
+
+    async fn share(&self, admin: &str, id: i64, patch: Value) {
+        let res = self.json("PATCH", &format!("/api/admin/boards/{id}"), Some(admin), Some(patch)).await;
+        assert_eq!(res.status, StatusCode::OK, "{:?}", res.json);
     }
 }
 
@@ -113,252 +121,282 @@ fn png(width: u32, height: u32) -> Vec<u8> {
 async fn admin_routes_need_login_and_csrf_header() {
     let t = setup();
     assert_eq!(t.json("GET", "/api/admin/boards", None, None).await.status, StatusCode::UNAUTHORIZED);
-
     let res = t.json("POST", "/api/admin/login", None, Some(json!({ "password": "nope" }))).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
     assert!(res.cookie.is_none());
 
-    // Without the X-Revo header a state-changing call is refused, even when signed in.
     let cookie = t.login().await;
     let req = Request::builder()
         .method("POST")
         .uri("/api/admin/boards")
         .header(header::COOKIE, &cookie)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(json!({ "slug": "csrf", "title": "x" }).to_string()))
+        .body(Body::from(json!({ "title": "x" }).to_string()))
         .unwrap();
-    assert_eq!(t.send(req).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(t.send(req).await.status, StatusCode::BAD_REQUEST, "missing X-Revo header");
 
-    let res = t.json("GET", "/api/admin/session", Some(&cookie), None).await;
-    assert_eq!(res.json["admin"], true);
     t.json("POST", "/api/admin/logout", Some(&cookie), None).await;
     assert_eq!(t.json("GET", "/api/admin/boards", Some(&cookie), None).await.status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn slugs_are_validated_and_unique() {
+async fn board_links_come_from_titles_and_stay_unique() {
     let t = setup();
     let admin = t.login().await;
-    for bad in ["ab", "admin", "files", "-dash", "with space", "x/y"] {
-        let res = t.json("POST", "/api/admin/boards", Some(&admin), Some(json!({ "slug": bad, "title": "T" }))).await;
-        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad}");
-    }
-    let ok =
-        t.json("POST", "/api/admin/boards", Some(&admin), Some(json!({ "slug": "acme-co", "title": "Acme" }))).await;
-    assert_eq!(ok.status, StatusCode::OK);
-    let dup =
-        t.json("POST", "/api/admin/boards", Some(&admin), Some(json!({ "slug": "acme-co", "title": "Again" }))).await;
+    assert_eq!(t.board(&admin, "Café Mila — Menu").await.1, "cafe-mila-menu");
+    assert_eq!(t.board(&admin, "Café Mila — Menu").await.1, "cafe-mila-menu-2");
+    let bad = t.json("POST", "/api/admin/boards", Some(&admin), Some(json!({ "title": "T", "slug": "admin" }))).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    let dup = t
+        .json("POST", "/api/admin/boards", Some(&admin), Some(json!({ "title": "T", "slug": "cafe-mila-menu" })))
+        .await;
     assert_eq!(dup.status, StatusCode::CONFLICT);
+    let list = t.json("GET", "/api/admin/boards", Some(&admin), None).await;
+    assert_eq!(list.json.as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
-async fn full_review_flow_with_versions() {
+async fn sharing_controls_who_gets_in_and_what_they_can_do() {
     let t = setup();
     let admin = t.login().await;
+    let (id, slug) = t.board(&admin, "Workshop").await;
+    let url = format!("/api/b/{slug}");
 
-    let board = t
-        .json(
-            "POST",
-            "/api/admin/boards",
-            Some(&admin),
-            Some(json!({ "slug": "lumen", "title": "Atelier Lumen", "passcode": "spring26" })),
-        )
-        .await;
-    let board_id = board.json["id"].as_i64().unwrap();
+    // New boards are private.
+    assert_eq!(t.json("GET", &url, None, None).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(t.json("GET", &url, Some(&admin), None).await.json["role"], "owner");
 
-    let up = t.upload(&format!("/api/admin/boards/{board_id}/images"), &admin, &[("hero_shot.png", png(64, 32))]).await;
-    assert_eq!(up.status, StatusCode::OK, "{:?}", up.json);
-    let image_id = up.json["ids"][0].as_i64().unwrap();
-
-    // Not a real image.
-    let bad = t.upload(&format!("/api/admin/boards/{board_id}/images"), &admin, &[("x.png", b"hello".to_vec())]).await;
-    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
-
-    // A client without the passcode sees nothing, files included.
-    let locked = t.json("GET", "/api/b/lumen", None, None).await;
-    assert_eq!(locked.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(locked.json["error"], "passcode_required");
-
-    let wrong = t.json("POST", "/api/b/lumen/unlock", None, Some(json!({ "passcode": "nope" }))).await;
-    assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
-    let unlocked = t.json("POST", "/api/b/lumen/unlock", None, Some(json!({ "passcode": "spring26" }))).await;
-    let client = unlocked.cookie.expect("unlock sets a cookie");
-
-    let view = t.json("GET", "/api/b/lumen", Some(&client), None).await;
-    assert_eq!(view.status, StatusCode::OK);
-    assert_eq!(view.json["is_admin"], false);
-    let image = &view.json["images"][0];
-    assert_eq!(image["title"], "hero shot");
-    let v1 = image["versions"][0]["id"].as_i64().unwrap();
-    assert_eq!(image["versions"][0]["px_width"], 64);
-
-    // Display copy is visible to the client; the original is admin-only.
-    let file = t.json("GET", &format!("/files/{v1}/display"), Some(&client), None).await;
-    assert_eq!(file.status, StatusCode::OK);
-    assert!(!file.bytes.is_empty());
-    assert_eq!(t.json("GET", &format!("/files/{v1}/display"), None, None).await.status, StatusCode::NOT_FOUND);
+    t.share(&admin, id, json!({ "access": "view" })).await;
+    assert_eq!(t.json("GET", &url, None, None).await.json["role"], "view");
+    let comment = json!({ "x": 10.0, "y": 20.0, "author": "Anna", "body": "Nice" });
     assert_eq!(
-        t.json("GET", &format!("/files/{v1}/original"), Some(&client), None).await.status,
-        StatusCode::NOT_FOUND
+        t.json("POST", &format!("{url}/comments"), None, Some(comment.clone())).await.status,
+        StatusCode::FORBIDDEN
     );
-    assert_eq!(t.json("GET", &format!("/files/{v1}/original"), Some(&admin), None).await.status, StatusCode::OK);
+    assert_eq!(t.upload(&format!("{url}/assets"), None, "a.png", png(8, 8)).await.status, StatusCode::FORBIDDEN);
 
-    // Comment pin, reply, decision.
-    let no_pin = t
-        .json(
-            "POST",
-            "/api/b/lumen/comments",
-            Some(&client),
-            Some(json!({ "version_id": v1, "author": "Anna", "body": "Hi" })),
-        )
-        .await;
-    assert_eq!(no_pin.status, StatusCode::BAD_REQUEST);
-    let root = t
-        .json(
-            "POST",
-            "/api/b/lumen/comments",
-            Some(&client),
-            Some(json!({ "version_id": v1, "x": 0.25, "y": 0.5, "author": "Anna", "body": "Warmer skin tones here" })),
-        )
-        .await;
-    assert_eq!(root.status, StatusCode::OK);
-    let root_id = root.json["id"].as_i64().unwrap();
+    t.share(&admin, id, json!({ "access": "comment" })).await;
+    let c = t.json("POST", &format!("{url}/comments"), None, Some(comment)).await;
+    assert_eq!(c.status, StatusCode::OK, "{:?}", c.json);
+    let root = c.json["id"].as_i64().unwrap();
     let reply = t
         .json(
             "POST",
-            "/api/b/lumen/comments",
-            Some(&admin),
-            Some(json!({ "version_id": v1, "parent_id": root_id, "body": "On it" })),
+            &format!("{url}/comments"),
+            None,
+            Some(json!({ "parent_id": root, "author": "Marc", "body": "Agreed" })),
         )
         .await;
     assert_eq!(reply.status, StatusCode::OK);
-    let status = t
-        .json(
-            "POST",
-            &format!("/api/b/lumen/versions/{v1}/status"),
-            Some(&client),
-            Some(json!({ "status": "changes_requested", "author": "Anna" })),
-        )
-        .await;
-    assert_eq!(status.status, StatusCode::OK);
+    let resolved =
+        t.json("POST", &format!("{url}/comments/{root}/resolve"), None, Some(json!({ "resolved": true }))).await;
+    assert!(resolved.json["resolved_at"].is_i64());
+    assert_eq!(t.json("DELETE", &format!("{url}/comments/{root}"), None, None).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(t.json("DELETE", &format!("{url}/comments/{root}"), Some(&admin), None).await.status, StatusCode::OK);
 
-    // Clients cannot resolve; the admin can.
-    let res = t
-        .json(
-            "POST",
-            &format!("/api/admin/comments/{root_id}/resolve"),
-            Some(&client),
-            Some(json!({ "resolved": true })),
-        )
-        .await;
-    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
-    let res = t
-        .json(
-            "POST",
-            &format!("/api/admin/comments/{root_id}/resolve"),
-            Some(&admin),
-            Some(json!({ "resolved": true })),
-        )
-        .await;
-    assert_eq!(res.status, StatusCode::OK);
+    // A passcode gates the link; changing it signs people out.
+    t.share(&admin, id, json!({ "access": "edit", "passcode": "mila" })).await;
+    let locked = t.json("GET", &url, None, None).await;
+    assert_eq!(locked.json["error"], "passcode_required");
+    assert_eq!(
+        t.json("POST", &format!("{url}/unlock"), None, Some(json!({ "passcode": "nope" }))).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    let guest =
+        t.json("POST", &format!("{url}/unlock"), None, Some(json!({ "passcode": "mila" }))).await.cookie.unwrap();
+    assert_eq!(t.json("GET", &url, Some(&guest), None).await.json["role"], "edit");
+    t.share(&admin, id, json!({ "passcode": "new-one" })).await;
+    assert_eq!(t.json("GET", &url, Some(&guest), None).await.status, StatusCode::UNAUTHORIZED);
 
-    // A new version starts clean; the old one keeps its comments and decision.
-    let v2 = t.upload(&format!("/api/admin/images/{image_id}/versions"), &admin, &[("hero_v2.png", png(80, 40))]).await;
-    assert_eq!(v2.status, StatusCode::OK, "{:?}", v2.json);
-    assert_eq!(v2.json["number"], 2);
-
-    let view = t.json("GET", "/api/b/lumen", Some(&client), None).await;
-    let versions = view.json["images"][0]["versions"].as_array().unwrap().clone();
-    assert_eq!(versions.len(), 2);
-    assert_eq!(versions[0]["status"], "changes_requested");
-    assert_eq!(versions[0]["status_by"], "Anna");
-    assert_eq!(versions[0]["comments"].as_array().unwrap().len(), 2);
-    assert!(versions[0]["comments"][0]["resolved_at"].is_i64());
-    assert_eq!(versions[0]["comments"][1]["author"], "Betch");
-    assert_eq!(versions[0]["comments"][1]["is_admin"], true);
-    assert_eq!(versions[1]["status"], "pending");
-    assert_eq!(versions[1]["comments"].as_array().unwrap().len(), 0);
-
-    // Arrange.
-    let res = t
-        .json(
-            "PATCH",
-            &format!("/api/admin/images/{image_id}"),
-            Some(&admin),
-            Some(json!({ "x": 10.0, "y": 20.0, "width": 400.0 })),
-        )
-        .await;
-    assert_eq!(res.status, StatusCode::OK);
-    let view = t.json("GET", "/api/b/lumen", Some(&client), None).await;
-    assert_eq!(view.json["images"][0]["width"], 400.0);
-
-    // Changing the passcode signs the client out.
-    t.json("PATCH", &format!("/api/admin/boards/{board_id}"), Some(&admin), Some(json!({ "passcode": "summer26" })))
-        .await;
-    assert_eq!(t.json("GET", "/api/b/lumen", Some(&client), None).await.status, StatusCode::UNAUTHORIZED);
-
-    // Deleting the board removes it and its files.
-    let images_dir = t.data_dir.join("images");
-    assert!(std::fs::read_dir(&images_dir).unwrap().count() > 0);
-    let res = t.json("DELETE", &format!("/api/admin/boards/{board_id}"), Some(&admin), None).await;
-    assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(std::fs::read_dir(&images_dir).unwrap().count(), 0);
-    assert_eq!(t.json("GET", "/api/b/lumen", Some(&admin), None).await.status, StatusCode::NOT_FOUND);
+    // Back to private: the link stops working, even with a passcode.
+    t.share(&admin, id, json!({ "access": "private" })).await;
+    assert_eq!(
+        t.json("POST", &format!("{url}/unlock"), None, Some(json!({ "passcode": "new-one" }))).await.status,
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test]
-async fn open_board_needs_no_passcode_and_comments_need_a_name() {
+async fn images_upload_duplicate_and_delete() {
     let t = setup();
     let admin = t.login().await;
-    let board =
-        t.json("POST", "/api/admin/boards", Some(&admin), Some(json!({ "slug": "open-board", "title": "Open" }))).await;
-    let board_id = board.json["id"].as_i64().unwrap();
-    t.upload(&format!("/api/admin/boards/{board_id}/images"), &admin, &[("a.png", png(10, 10))]).await;
+    let (id, slug) = t.board(&admin, "Moodboard").await;
 
-    let view = t.json("GET", "/api/b/open-board", None, None).await;
-    assert_eq!(view.status, StatusCode::OK);
-    let v1 = view.json["images"][0]["versions"][0]["id"].as_i64().unwrap();
-    let res = t
-        .json(
-            "POST",
-            "/api/b/open-board/comments",
-            None,
-            Some(json!({ "version_id": v1, "x": 0.5, "y": 0.5, "body": "Hi" })),
-        )
-        .await;
-    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let up = t.upload(&format!("/api/b/{slug}/assets"), Some(&admin), "photo.png", png(64, 32)).await;
+    assert_eq!(up.status, StatusCode::OK, "{:?}", up.json);
+    assert_eq!(up.json["w"], 64);
+    let asset = up.json["id"].as_i64().unwrap();
+    let bad = t.upload(&format!("/api/b/{slug}/assets"), Some(&admin), "x.png", b"hello".to_vec()).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
 
-    // A version from another board is rejected.
-    let other = t
-        .json("POST", "/api/admin/boards", Some(&admin), Some(json!({ "slug": "other-board", "title": "Other" })))
-        .await;
-    let other_id = other.json["id"].as_i64().unwrap();
-    t.upload(&format!("/api/admin/boards/{other_id}/images"), &admin, &[("b.png", png(10, 10))]).await;
-    let res = t
-        .json(
-            "POST",
-            "/api/b/open-board/comments",
-            None,
-            Some(json!({ "version_id": v1 + 1, "x": 0.5, "y": 0.5, "body": "Hi", "author": "Eve" })),
-        )
-        .await;
-    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    // Files follow the board's sharing.
+    assert_eq!(t.json("GET", &format!("/files/{asset}/display"), None, None).await.status, StatusCode::NOT_FOUND);
+    t.share(&admin, id, json!({ "access": "view" })).await;
+    let file = t.json("GET", &format!("/files/{asset}/display"), None, None).await;
+    assert_eq!(file.status, StatusCode::OK);
+    assert!(!file.bytes.is_empty());
+    assert_eq!(t.json("GET", &format!("/files/{asset}/original"), None, None).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(t.json("GET", &format!("/files/{asset}/original"), Some(&admin), None).await.status, StatusCode::OK);
+
+    // Put an image item on the board through the same code the live connection uses.
+    let ops = revo::items::parse_ops(&json!([
+        { "put": { "id": "img1", "type": "image", "asset": asset, "x": 0, "y": 0, "w": 64, "h": 32 } },
+        { "put": { "id": "note1", "type": "sticky", "x": 100, "y": 0, "w": 200, "h": 200, "text": "Hi" } }
+    ]))
+    .unwrap();
+    t.state.db.call(move |c| revo::items::apply(c, id, &ops)).await.unwrap();
+
+    let copy = t.json("POST", &format!("/api/admin/boards/{id}/duplicate"), Some(&admin), None).await;
+    assert_eq!(copy.status, StatusCode::OK);
+    assert_eq!(copy.json["slug"], "moodboard-copy");
+    assert_eq!(copy.json["access"], "private");
+    let copy_id = copy.json["id"].as_i64().unwrap();
+    let items = t.state.db.call(move |c| revo::items::load(c, copy_id)).await.unwrap();
+    assert_eq!(items.len(), 2);
+    let copied_asset = items.iter().find(|i| i["type"] == "image").unwrap()["asset"].as_i64().unwrap();
+    assert_ne!(copied_asset, asset, "the copy gets its own asset row");
+
+    // Deleting the original keeps the files the copy still uses.
+    let images_dir = t.data_dir.join("images");
+    let files_before = std::fs::read_dir(&images_dir).unwrap().count();
+    assert_eq!(t.json("DELETE", &format!("/api/admin/boards/{id}"), Some(&admin), None).await.status, StatusCode::OK);
+    assert_eq!(std::fs::read_dir(&images_dir).unwrap().count(), files_before);
+    assert_eq!(
+        t.json("GET", &format!("/files/{copied_asset}/display"), Some(&admin), None).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        t.json("DELETE", &format!("/api/admin/boards/{copy_id}"), Some(&admin), None).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(std::fs::read_dir(&images_dir).unwrap().count(), 0);
 }
 
 #[tokio::test]
 async fn passcode_guessing_is_throttled() {
     let t = setup();
     let admin = t.login().await;
-    t.json(
-        "POST",
-        "/api/admin/boards",
-        Some(&admin),
-        Some(json!({ "slug": "locked", "title": "L", "passcode": "secret" })),
-    )
-    .await;
+    let (id, slug) = t.board(&admin, "Locked").await;
+    t.share(&admin, id, json!({ "access": "view", "passcode": "secret" })).await;
     let mut last = StatusCode::OK;
     for _ in 0..9 {
-        last = t.json("POST", "/api/b/locked/unlock", None, Some(json!({ "passcode": "guess" }))).await.status;
+        last =
+            t.json("POST", &format!("/api/b/{slug}/unlock"), None, Some(json!({ "passcode": "guess" }))).await.status;
     }
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+}
+
+// ---------------------------------------------------------------- live collaboration
+
+type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn serve(t: &TestApp) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(t.state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    addr.to_string()
+}
+
+async fn ws_connect(addr: &str, slug: &str, cookie: Option<&str>, origin: &str) -> Result<Socket, tungstenite::Error> {
+    let mut req = format!("ws://{addr}/api/b/{slug}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("origin", origin.parse().unwrap());
+    if let Some(c) = cookie {
+        req.headers_mut().insert("cookie", c.parse().unwrap());
+    }
+    tokio_tungstenite::connect_async(req).await.map(|(s, _)| s)
+}
+
+async fn send(ws: &mut Socket, v: Value) {
+    ws.send(tungstenite::Message::Text(v.to_string().into())).await.unwrap();
+}
+
+/// Next JSON message, skipping types we don't care about.
+async fn next(ws: &mut Socket, skip: &[&str]) -> Value {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("timed out").unwrap().unwrap();
+        if let tungstenite::Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(t.as_str()).unwrap();
+            if !skip.contains(&v["t"].as_str().unwrap_or("")) {
+                return v;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_edits_reach_others_and_are_saved() {
+    let t = setup();
+    let admin = t.login().await;
+    let (id, slug) = t.board(&admin, "Live").await;
+    let addr = serve(&t).await;
+    let origin = format!("http://{addr}");
+
+    // Private board: a guest can't connect; another site can't connect either.
+    assert!(ws_connect(&addr, &slug, None, &origin).await.is_err());
+    assert!(ws_connect(&addr, &slug, Some(&admin), "https://evil.example").await.is_err());
+
+    let mut owner = ws_connect(&addr, &slug, Some(&admin), &origin).await.unwrap();
+    send(&mut owner, json!({ "t": "hello", "name": "Betch", "color": "#63d9dd" })).await;
+    let welcome = next(&mut owner, &[]).await;
+    assert_eq!(welcome["t"], "welcome");
+    assert_eq!(welcome["you"]["role"], "owner");
+    assert_eq!(welcome["items"].as_array().unwrap().len(), 0);
+
+    t.share(&admin, id, json!({ "access": "edit" })).await;
+    assert_eq!(next(&mut owner, &[]).await["t"], "reload");
+
+    let mut guest = ws_connect(&addr, &slug, None, &origin).await.unwrap();
+    send(&mut guest, json!({ "t": "hello", "name": "Anna", "color": "#f97316" })).await;
+    let gw = next(&mut guest, &[]).await;
+    assert_eq!(gw["you"]["role"], "edit");
+    assert_eq!(gw["peers"][0]["name"], "Betch");
+    let joined = next(&mut owner, &[]).await;
+    assert_eq!(joined["t"], "peer");
+    assert_eq!(joined["peer"]["name"], "Anna");
+
+    // A live (dragging) change is relayed but not saved; the final one is saved.
+    let note = json!({ "id": "n1", "type": "sticky", "x": 0, "y": 0, "w": 200, "h": 200, "text": "Hi" });
+    send(&mut guest, json!({ "t": "ops", "live": true, "ops": [{ "put": note }] })).await;
+    let live = next(&mut owner, &["cursor"]).await;
+    assert_eq!(live["live"], true);
+    assert!(t.state.db.call(move |c| revo::items::load(c, id)).await.unwrap().is_empty());
+    send(&mut guest, json!({ "t": "ops", "ops": [{ "put": note }] })).await;
+    let saved = next(&mut owner, &["cursor"]).await;
+    assert_eq!(saved["ops"][0]["put"]["text"], "Hi");
+    assert_eq!(t.state.db.call(move |c| revo::items::load(c, id)).await.unwrap().len(), 1);
+
+    // Cursors are relayed with the sender's id.
+    send(&mut guest, json!({ "t": "cursor", "x": 12.5, "y": 40.0 })).await;
+    let cur = next(&mut owner, &[]).await;
+    assert_eq!(cur["t"], "cursor");
+    assert_eq!(cur["x"], 12.5);
+
+    // Invalid items are refused and the sender is told to resync.
+    send(&mut guest, json!({ "t": "ops", "ops": [{ "put": { "id": "bad id", "type": "sticky" } }] })).await;
+    assert_eq!(next(&mut guest, &[]).await["t"], "error");
+    assert_eq!(next(&mut guest, &[]).await["t"], "resync");
+
+    // Comments made over HTTP show up live.
+    let c = t
+        .json(
+            "POST",
+            &format!("/api/b/{slug}/comments"),
+            None,
+            Some(json!({ "x": 1.0, "y": 2.0, "author": "Anna", "body": "Hello" })),
+        )
+        .await;
+    assert_eq!(c.status, StatusCode::OK);
+    assert_eq!(next(&mut owner, &[]).await["comment"]["body"], "Hello");
+
+    // A viewer can watch but not edit.
+    t.share(&admin, id, json!({ "access": "view" })).await;
+    let mut viewer = ws_connect(&addr, &slug, None, &origin).await.unwrap();
+    send(&mut viewer, json!({ "t": "hello", "name": "Marc" })).await;
+    let vw = next(&mut viewer, &[]).await;
+    assert_eq!(vw["items"][0]["id"], "n1");
+    send(&mut viewer, json!({ "t": "ops", "ops": [{ "del": "n1" }] })).await;
+    assert_eq!(next(&mut viewer, &["peer"]).await["t"], "error");
+    assert_eq!(t.state.db.call(move |c| revo::items::load(c, id)).await.unwrap().len(), 1);
+    drop(guest);
 }

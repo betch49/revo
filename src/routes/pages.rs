@@ -6,9 +6,10 @@ use axum::{
 };
 use axum_extra::extract::CookieJar;
 
-use super::valid_slug;
+use super::{board_access_by_id, valid_slug};
 use crate::{
-    AppState, auth,
+    AppState,
+    auth::{self, Role},
     error::{ApiResult, AppError},
     images::{self, Variant},
 };
@@ -21,7 +22,12 @@ const BOARD_HTML: &str = include_str!("../../static/board.html");
 const ASSETS: &[(&str, &str, &[u8])] = &[
     ("app.css", "text/css; charset=utf-8", include_bytes!("../../static/app.css")),
     ("common.js", "text/javascript; charset=utf-8", include_bytes!("../../static/common.js")),
-    ("board.js", "text/javascript; charset=utf-8", include_bytes!("../../static/board.js")),
+    ("board.css", "text/css; charset=utf-8", include_bytes!("../../static/board.css")),
+    ("board-core.js", "text/javascript; charset=utf-8", include_bytes!("../../static/board-core.js")),
+    ("board-render.js", "text/javascript; charset=utf-8", include_bytes!("../../static/board-render.js")),
+    ("board-tools.js", "text/javascript; charset=utf-8", include_bytes!("../../static/board-tools.js")),
+    ("board-ui.js", "text/javascript; charset=utf-8", include_bytes!("../../static/board-ui.js")),
+    ("board-main.js", "text/javascript; charset=utf-8", include_bytes!("../../static/board-main.js")),
     ("admin.js", "text/javascript; charset=utf-8", include_bytes!("../../static/admin.js")),
     ("favicon.svg", "image/svg+xml", include_bytes!("../../static/favicon.svg")),
     ("space-grotesk.woff2", "font/woff2", include_bytes!("../../static/fonts/space-grotesk-latin-wght-normal.woff2")),
@@ -60,32 +66,31 @@ pub async fn asset(Path(file): Path<String>) -> Response {
     }
 }
 
-/// Serve an image file, after checking the viewer may see its board.
+/// Serve an uploaded image, after checking the viewer may see its board.
 pub async fn file(
     State(state): State<AppState>,
     jar: CookieJar,
-    Path((version_id, variant)): Path<(i64, String)>,
+    Path((asset_id, variant)): Path<(i64, String)>,
 ) -> ApiResult<Response> {
     let variant = Variant::parse(&variant).ok_or(AppError::NotFound)?;
-    let (board_id, has_passcode, key, mime, display_mime, original_name): (i64, bool, String, String, String, String) =
-        state
-            .db
-            .call(move |c| {
-                Ok(c.query_row(
-                    "SELECT b.id, b.passcode_hash IS NOT NULL, v.file_key, v.mime, v.display_mime, v.original_name
-                     FROM image_versions v JOIN images i ON i.id = v.image_id JOIN boards b ON b.id = i.board_id
-                     WHERE v.id = ?1",
-                    [version_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-                )?)
-            })
-            .await?;
-    let admin = auth::is_admin(&state, &jar).await?;
-    if !auth::can_view(&state, &jar, board_id, has_passcode, admin).await? {
-        return Err(AppError::NotFound);
-    }
-    // Full-resolution originals are for the admin; clients review the web copy.
-    if variant == Variant::Original && !admin {
+    let (board, key, mime, display_mime, original_name) = state
+        .db
+        .call(move |c| {
+            let (board_id, key, mime, display_mime, name): (i64, String, String, String, String) = c.query_row(
+                "SELECT board_id, file_key, mime, display_mime, original_name FROM assets WHERE id = ?1",
+                [asset_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+            Ok((board_access_by_id(c, board_id)?, key, mime, display_mime, name))
+        })
+        .await?;
+    let role = match auth::role_for(&state, &jar, &board).await {
+        Ok(role) => role,
+        Err(AppError::PasscodeRequired) => return Err(AppError::NotFound),
+        Err(e) => return Err(e),
+    };
+    // Full-resolution originals are for people who can edit.
+    if variant == Variant::Original && role < Role::Edit {
         return Err(AppError::NotFound);
     }
 

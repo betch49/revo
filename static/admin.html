@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
-  <title>Boards · Betch review</title>
+  <title>Boards · Betch</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="preload" href="/static/space-grotesk.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/static/app.css">
@@ -14,9 +14,9 @@
 <body>
   <div class="center-page" id="login" hidden>
     <form class="card" id="login-form">
-      <span class="brand"><span class="dot"></span>betch <small>review</small></span>
+      <span class="brand"><span class="dot"></span>betch <small>boards</small></span>
       <h1>Admin sign in</h1>
-      <p>Manage review boards for your clients.</p>
+      <p>Sign in to manage your boards.</p>
       <div class="field">
         <label for="login-password">Password</label>
         <input type="password" id="login-password" autocomplete="current-password" required>
@@ -28,7 +28,7 @@
 
   <div class="admin-shell" id="dashboard" hidden>
     <header class="admin-top">
-      <span class="brand"><span class="dot"></span>betch <small>review</small></span>
+      <span class="brand"><span class="dot"></span>betch <small>boards</small></span>
       <span class="spacer"></span>
       <button type="button" class="ghost" id="logout">Sign out</button>
     </header>
@@ -36,19 +36,15 @@
       <form class="card" id="create-form">
         <h2>New board</h2>
         <div class="field">
-          <label for="new-title">Client / project</label>
-          <input type="text" id="new-title" maxlength="120" placeholder="e.g. Atelier Lumen — spring lookbook" required>
+          <label for="new-title">Name</label>
+          <input type="text" id="new-title" maxlength="120" placeholder="e.g. Café Mila — brand workshop" required>
         </div>
         <div class="field">
-          <label for="new-slug">Link</label>
-          <input type="text" id="new-slug" maxlength="64" placeholder="atelier-lumen" required pattern="[a-z0-9][a-z0-9\-]{1,62}[a-z0-9]">
+          <label for="new-slug">Link (optional)</label>
+          <input type="text" id="new-slug" maxlength="64" placeholder="made from the name" pattern="[a-z0-9][a-z0-9\-]{1,62}[a-z0-9]">
           <div class="hint" id="slug-preview"></div>
         </div>
-        <div class="field">
-          <label for="new-passcode">Passcode (optional)</label>
-          <input type="text" id="new-passcode" maxlength="100" autocomplete="off" placeholder="Leave empty for link-only access">
-          <div class="hint">Clients enter it once per browser. You can change it later.</div>
-        </div>
+        <p class="hint">New boards are private. Use Share on the board or its card to invite people.</p>
         <div class="error-text" id="create-error"></div>
         <button type="submit" class="primary">Create board</button>
       </form>

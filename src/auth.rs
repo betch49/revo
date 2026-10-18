@@ -8,6 +8,7 @@ use axum::{extract::FromRequestParts, http::request::Parts};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use rand::Rng;
 use rusqlite::{OptionalExtension, params};
+use serde::Serialize;
 
 use crate::{AppState, db::now, error::AppError};
 
@@ -104,22 +105,53 @@ pub async fn is_admin(state: &AppState, jar: &CookieJar) -> Result<bool, AppErro
         .await
 }
 
-/// Whether this browser may view a board: no passcode set, a valid access
-/// cookie, or a signed-in admin.
-pub async fn can_view(
-    state: &AppState,
-    jar: &CookieJar,
-    board_id: i64,
-    has_passcode: bool,
-    admin: bool,
-) -> Result<bool, AppError> {
-    if !has_passcode || admin {
-        return Ok(true);
+/// What a browser may do on a board, from least to most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    View,
+    Comment,
+    Edit,
+    Owner,
+}
+
+impl Role {
+    /// The role a board's link grants (`private` grants nothing).
+    pub fn from_access(access: &str) -> Option<Self> {
+        match access {
+            "view" => Some(Self::View),
+            "comment" => Some(Self::Comment),
+            "edit" => Some(Self::Edit),
+            _ => None,
+        }
     }
-    let Some(token) = jar.get(&board_cookie_name(board_id)).map(|c| c.value().to_string()) else {
-        return Ok(false);
+}
+
+pub const ACCESS_LEVELS: &[&str] = &["private", "view", "comment", "edit"];
+
+/// The fields of a board needed to decide access.
+#[derive(Clone, Debug)]
+pub struct BoardAccess {
+    pub id: i64,
+    pub access: String,
+    pub has_passcode: bool,
+}
+
+/// Work out this browser's role on a board. The owner always gets in;
+/// everyone else needs a shared link and, if set, the passcode.
+pub async fn role_for(state: &AppState, jar: &CookieJar, board: &BoardAccess) -> Result<Role, AppError> {
+    if is_admin(state, jar).await? {
+        return Ok(Role::Owner);
+    }
+    let role = Role::from_access(&board.access).ok_or(AppError::NotFound)?;
+    if !board.has_passcode {
+        return Ok(role);
+    }
+    let Some(token) = jar.get(&board_cookie_name(board.id)).map(|c| c.value().to_string()) else {
+        return Err(AppError::PasscodeRequired);
     };
-    state
+    let board_id = board.id;
+    let ok = state
         .db
         .call(move |c| {
             let found = c
@@ -131,7 +163,8 @@ pub async fn can_view(
                 .optional()?;
             Ok(found.is_some())
         })
-        .await
+        .await?;
+    if ok { Ok(role) } else { Err(AppError::PasscodeRequired) }
 }
 
 /// Extractor for routes only the admin may call.

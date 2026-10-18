@@ -14,31 +14,27 @@ CREATE TABLE IF NOT EXISTS boards (
     id            INTEGER PRIMARY KEY,
     slug          TEXT NOT NULL UNIQUE,
     title         TEXT NOT NULL,
+    -- Who can open the board with its link: private (owner only), view, comment or edit.
+    access        TEXT NOT NULL DEFAULT 'private',
     passcode_hash TEXT,
-    -- Bumped on every change so open boards know to refresh.
-    rev           INTEGER NOT NULL DEFAULT 1,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
 );
 
--- An image placed on a board. Its pixels live in image_versions.
-CREATE TABLE IF NOT EXISTS images (
-    id         INTEGER PRIMARY KEY,
+-- Everything drawn on a board (stickies, shapes, text, connectors, strokes,
+-- frames, images). The front end owns the JSON shape; the server stores it.
+CREATE TABLE IF NOT EXISTS items (
     board_id   INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
-    title      TEXT NOT NULL,
-    x          REAL NOT NULL,
-    y          REAL NOT NULL,
-    -- Width on the board, in board units. Height follows the version's aspect ratio.
-    width      REAL NOT NULL,
-    z          INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS images_board ON images(board_id);
+    id         TEXT NOT NULL,
+    data       TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (board_id, id)
+) WITHOUT ROWID;
 
--- One uploaded file. Review status belongs to the version, not the image.
-CREATE TABLE IF NOT EXISTS image_versions (
+-- Uploaded image files. Image items point at an asset id.
+CREATE TABLE IF NOT EXISTS assets (
     id            INTEGER PRIMARY KEY,
-    image_id      INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
-    number        INTEGER NOT NULL,
+    board_id      INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
     file_key      TEXT NOT NULL,
     original_name TEXT NOT NULL,
     mime          TEXT NOT NULL,
@@ -46,27 +42,24 @@ CREATE TABLE IF NOT EXISTS image_versions (
     display_mime  TEXT NOT NULL,
     px_width      INTEGER NOT NULL,
     px_height     INTEGER NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'pending',
-    status_by     TEXT,
-    status_at     INTEGER,
-    created_at    INTEGER NOT NULL,
-    UNIQUE (image_id, number)
+    created_at    INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS assets_board ON assets(board_id);
 
--- Root comments carry a pin position (fractions of the image size); replies have parent_id.
+-- Comment threads pinned to a point on the board; replies have parent_id.
 CREATE TABLE IF NOT EXISTS comments (
     id          INTEGER PRIMARY KEY,
-    version_id  INTEGER NOT NULL REFERENCES image_versions(id) ON DELETE CASCADE,
+    board_id    INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
     parent_id   INTEGER REFERENCES comments(id) ON DELETE CASCADE,
     x           REAL,
     y           REAL,
     author      TEXT NOT NULL,
-    is_admin    INTEGER NOT NULL DEFAULT 0,
+    is_owner    INTEGER NOT NULL DEFAULT 0,
     body        TEXT NOT NULL,
     resolved_at INTEGER,
     created_at  INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS comments_version ON comments(version_id);
+CREATE INDEX IF NOT EXISTS comments_board ON comments(board_id);
 
 CREATE TABLE IF NOT EXISTS admin_sessions (
     token      TEXT PRIMARY KEY,
@@ -98,7 +91,16 @@ impl Db {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
+        // Version 1 was the review-only prototype; its tables are not reused.
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 2 {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS comments; DROP TABLE IF EXISTS image_versions; DROP TABLE IF EXISTS images;
+                 DROP TABLE IF EXISTS board_access; DROP TABLE IF EXISTS boards;",
+            )?;
+        }
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch("PRAGMA user_version = 2")?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 
@@ -132,7 +134,7 @@ pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-pub fn bump_rev(conn: &Connection, board_id: i64) -> rusqlite::Result<()> {
-    conn.execute("UPDATE boards SET rev = rev + 1 WHERE id = ?1", [board_id])?;
+pub fn touch_board(conn: &Connection, board_id: i64) -> rusqlite::Result<()> {
+    conn.execute("UPDATE boards SET updated_at = ?1 WHERE id = ?2", rusqlite::params![now(), board_id])?;
     Ok(())
 }

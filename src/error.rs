@@ -13,6 +13,8 @@ pub enum AppError {
     Unauthorized,
     #[error("passcode required")]
     PasscodeRequired,
+    #[error("{0}")]
+    Forbidden(String),
     #[error("not found")]
     NotFound,
     #[error("{0}")]
@@ -46,6 +48,7 @@ impl IntoResponse for AppError {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::PasscodeRequired => (StatusCode::UNAUTHORIZED, "passcode_required"),
+            Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),

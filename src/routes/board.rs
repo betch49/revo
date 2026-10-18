@@ -1,180 +1,115 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Multipart, Path, State, multipart::MultipartError},
 };
 use axum_extra::extract::CookieJar;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::clean_text;
+use super::{board_access_by_slug, clean_text};
 use crate::{
     AppState,
-    auth::{self, verify_password},
-    db::{bump_rev, now},
+    auth::{self, Role, verify_password},
+    db::{now, touch_board},
     error::{ApiResult, AppError},
+    hub::SERVER,
+    images,
 };
 
-pub const STATUSES: &[&str] = &["pending", "approved", "changes_requested"];
-
 #[derive(Serialize)]
-pub struct BoardView {
-    pub board: BoardInfo,
-    pub is_admin: bool,
-    pub images: Vec<ImageView>,
-}
-
-#[derive(Serialize)]
-pub struct BoardInfo {
+pub struct BoardMeta {
     pub id: i64,
     pub slug: String,
     pub title: String,
+    pub access: String,
     pub has_passcode: bool,
-    pub rev: i64,
 }
 
-#[derive(Serialize)]
-pub struct ImageView {
-    pub id: i64,
-    pub title: String,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub z: i64,
-    /// Oldest first; the last one is the current version.
-    pub versions: Vec<VersionView>,
-}
-
-#[derive(Serialize)]
-pub struct VersionView {
-    pub id: i64,
-    pub number: i64,
-    pub original_name: String,
-    pub px_width: i64,
-    pub px_height: i64,
-    pub status: String,
-    pub status_by: Option<String>,
-    pub status_at: Option<i64>,
-    pub created_at: i64,
-    pub comments: Vec<CommentView>,
-}
-
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct CommentView {
     pub id: i64,
     pub parent_id: Option<i64>,
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub author: String,
-    pub is_admin: bool,
+    pub is_owner: bool,
     pub body: String,
     pub resolved_at: Option<i64>,
     pub created_at: i64,
 }
 
-/// Board row needed for access checks: (id, has_passcode).
-pub fn find_board(conn: &Connection, slug: &str) -> Result<(i64, Option<String>), AppError> {
-    Ok(conn.query_row("SELECT id, passcode_hash FROM boards WHERE slug = ?1", [slug], |r| Ok((r.get(0)?, r.get(1)?)))?)
-}
-
-pub fn load_board(conn: &Connection, board_id: i64, is_admin: bool) -> Result<BoardView, AppError> {
-    let board = conn.query_row(
-        "SELECT id, slug, title, passcode_hash IS NOT NULL, rev FROM boards WHERE id = ?1",
+pub fn board_meta(conn: &Connection, board_id: i64) -> Result<BoardMeta, AppError> {
+    Ok(conn.query_row(
+        "SELECT id, slug, title, access, passcode_hash IS NOT NULL FROM boards WHERE id = ?1",
         [board_id],
-        |r| Ok(BoardInfo { id: r.get(0)?, slug: r.get(1)?, title: r.get(2)?, has_passcode: r.get(3)?, rev: r.get(4)? }),
-    )?;
-
-    let mut images: Vec<ImageView> = conn
-        .prepare("SELECT id, title, x, y, width, z FROM images WHERE board_id = ?1 ORDER BY z, id")?
-        .query_map([board_id], |r| {
-            Ok(ImageView {
+        |r| {
+            Ok(BoardMeta {
                 id: r.get(0)?,
-                title: r.get(1)?,
-                x: r.get(2)?,
-                y: r.get(3)?,
-                width: r.get(4)?,
-                z: r.get(5)?,
-                versions: Vec::new(),
+                slug: r.get(1)?,
+                title: r.get(2)?,
+                access: r.get(3)?,
+                has_passcode: r.get(4)?,
             })
-        })?
-        .collect::<Result<_, _>>()?;
-
-    let mut versions = conn.prepare(
-        "SELECT id, number, original_name, px_width, px_height, status, status_by, status_at, created_at
-         FROM image_versions WHERE image_id = ?1 ORDER BY number",
-    )?;
-    let mut comments = conn.prepare(
-        "SELECT id, parent_id, x, y, author, is_admin, body, resolved_at, created_at
-         FROM comments WHERE version_id = ?1 ORDER BY id",
-    )?;
-    for image in &mut images {
-        image.versions = versions
-            .query_map([image.id], |r| {
-                Ok(VersionView {
-                    id: r.get(0)?,
-                    number: r.get(1)?,
-                    original_name: r.get(2)?,
-                    px_width: r.get(3)?,
-                    px_height: r.get(4)?,
-                    status: r.get(5)?,
-                    status_by: r.get(6)?,
-                    status_at: r.get(7)?,
-                    created_at: r.get(8)?,
-                    comments: Vec::new(),
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-        for version in &mut image.versions {
-            version.comments = comments
-                .query_map([version.id], |r| {
-                    Ok(CommentView {
-                        id: r.get(0)?,
-                        parent_id: r.get(1)?,
-                        x: r.get(2)?,
-                        y: r.get(3)?,
-                        author: r.get(4)?,
-                        is_admin: r.get(5)?,
-                        body: r.get(6)?,
-                        resolved_at: r.get(7)?,
-                        created_at: r.get(8)?,
-                    })
-                })?
-                .collect::<Result<_, _>>()?;
-        }
-    }
-    Ok(BoardView { board, is_admin, images })
+        },
+    )?)
 }
 
-/// Resolve a slug to a board id, failing unless this browser may view it.
-async fn authorize(state: &AppState, jar: &CookieJar, slug: String) -> ApiResult<(i64, bool)> {
-    let (board_id, passcode) = state.db.call(move |c| find_board(c, &slug)).await?;
-    let admin = auth::is_admin(state, jar).await?;
-    if !auth::can_view(state, jar, board_id, passcode.is_some(), admin).await? {
-        return Err(AppError::PasscodeRequired);
+const COMMENT_COLUMNS: &str = "id, parent_id, x, y, author, is_owner, body, resolved_at, created_at";
+
+fn comment_row(r: &rusqlite::Row) -> rusqlite::Result<CommentView> {
+    Ok(CommentView {
+        id: r.get(0)?,
+        parent_id: r.get(1)?,
+        x: r.get(2)?,
+        y: r.get(3)?,
+        author: r.get(4)?,
+        is_owner: r.get(5)?,
+        body: r.get(6)?,
+        resolved_at: r.get(7)?,
+        created_at: r.get(8)?,
+    })
+}
+
+pub fn load_comments(conn: &Connection, board_id: i64) -> Result<Vec<CommentView>, AppError> {
+    Ok(conn
+        .prepare_cached(&format!("SELECT {COMMENT_COLUMNS} FROM comments WHERE board_id = ?1 ORDER BY id"))?
+        .query_map([board_id], comment_row)?
+        .collect::<Result<_, _>>()?)
+}
+
+fn load_comment(conn: &Connection, id: i64) -> Result<CommentView, AppError> {
+    Ok(conn.query_row(&format!("SELECT {COMMENT_COLUMNS} FROM comments WHERE id = ?1"), [id], comment_row)?)
+}
+
+/// Resolve a slug to its board and this browser's role there.
+pub async fn authorize(state: &AppState, jar: &CookieJar, slug: String) -> ApiResult<(i64, Role)> {
+    let board = state.db.call(move |c| board_access_by_slug(c, &slug)).await?;
+    let role = auth::role_for(state, jar, &board).await?;
+    Ok((board.id, role))
+}
+
+fn require(role: Role, needed: Role) -> ApiResult<()> {
+    if role >= needed {
+        Ok(())
+    } else {
+        let what = match needed {
+            Role::Comment => "comment on",
+            Role::Edit => "edit",
+            _ => "manage",
+        };
+        Err(AppError::Forbidden(format!("You don't have permission to {what} this board.")))
     }
-    Ok((board_id, admin))
 }
 
 pub async fn get_board(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(slug): Path<String>,
-) -> ApiResult<Json<BoardView>> {
-    let (board_id, admin) = authorize(&state, &jar, slug).await?;
-    Ok(Json(state.db.call(move |c| load_board(c, board_id, admin)).await?))
-}
-
-pub async fn get_rev(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(slug): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let (board_id, _) = authorize(&state, &jar, slug).await?;
-    let rev: i64 = state
-        .db
-        .call(move |c| Ok(c.query_row("SELECT rev FROM boards WHERE id = ?1", [board_id], |r| r.get(0))?))
-        .await?;
-    Ok(Json(json!({ "rev": rev })))
+    let (board_id, role) = authorize(&state, &jar, slug).await?;
+    let board = state.db.call(move |c| board_meta(c, board_id)).await?;
+    Ok(Json(json!({ "board": board, "role": role, "public_url": state.config.public_url })))
 }
 
 #[derive(Deserialize)]
@@ -188,7 +123,17 @@ pub async fn unlock(
     Path(slug): Path<String>,
     Json(body): Json<UnlockBody>,
 ) -> ApiResult<(CookieJar, Json<Value>)> {
-    let (board_id, passcode_hash) = state.db.call(move |c| find_board(c, &slug)).await?;
+    let (board_id, access, passcode_hash): (i64, String, Option<String>) = state
+        .db
+        .call(move |c| {
+            Ok(c.query_row("SELECT id, access, passcode_hash FROM boards WHERE slug = ?1", [&slug], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?)
+        })
+        .await?;
+    if Role::from_access(&access).is_none() {
+        return Err(AppError::NotFound);
+    }
     let Some(hash) = passcode_hash else {
         return Ok((jar, Json(json!({ "ok": true }))));
     };
@@ -205,9 +150,56 @@ pub async fn unlock(
     Ok((jar.add(cookie), Json(json!({ "ok": true }))))
 }
 
+/// Upload an image for the board. The browser then places an image item that
+/// points at the returned asset id.
+pub async fn upload_asset(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(slug): Path<String>,
+    mut multipart: Multipart,
+) -> ApiResult<Json<Value>> {
+    let (board_id, role) = authorize(&state, &jar, slug).await?;
+    require(role, Role::Edit)?;
+    let mut upload = None;
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
+        if field.name() == Some("file") {
+            let name: String = field.file_name().unwrap_or("image").chars().take(200).collect();
+            let bytes = field.bytes().await.map_err(multipart_error)?;
+            upload = Some((name, bytes));
+            break;
+        }
+    }
+    let Some((name, bytes)) = upload else {
+        return Err(AppError::bad("No file uploaded"));
+    };
+    let dir = state.images_dir.clone();
+    let img = tokio::task::spawn_blocking(move || images::store(&dir, &bytes))
+        .await
+        .map_err(|e| AppError::Internal(e.into()))??;
+    let (key, mime, display_mime) = (img.file_key.clone(), img.mime, img.display_mime);
+    let (w, h) = (img.px_width, img.px_height);
+    let result = state
+        .db
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO assets (board_id, file_key, original_name, mime, display_mime, px_width, px_height, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![board_id, img.file_key, name, img.mime, img.display_mime, img.px_width, img.px_height, now()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .await;
+    match result {
+        Ok(id) => Ok(Json(json!({ "id": id, "w": w, "h": h }))),
+        Err(e) => {
+            images::remove(&state.images_dir, &key, mime, display_mime);
+            Err(e)
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct NewComment {
-    version_id: i64,
     parent_id: Option<i64>,
     x: Option<f64>,
     y: Option<f64>,
@@ -220,108 +212,104 @@ pub async fn add_comment(
     jar: CookieJar,
     Path(slug): Path<String>,
     Json(input): Json<NewComment>,
-) -> ApiResult<Json<Value>> {
-    let (board_id, admin) = authorize(&state, &jar, slug).await?;
+) -> ApiResult<Json<CommentView>> {
+    let (board_id, role) = authorize(&state, &jar, slug).await?;
+    require(role, Role::Comment)?;
     let body = clean_text(&input.body, "Comment", 4000)?;
-    let author = match (&input.author, admin) {
-        (Some(a), _) if !a.trim().is_empty() => clean_text(a, "Name", 60)?,
-        (_, true) => "Betch".to_string(),
+    let owner = role == Role::Owner;
+    let author = match &input.author {
+        Some(a) if !a.trim().is_empty() => clean_text(a, "Name", 60)?,
+        _ if owner => "Betch".to_string(),
         _ => return Err(AppError::bad("Name is required")),
     };
     let pin = match input.parent_id {
         Some(_) => None,
         None => match (input.x, input.y) {
-            (Some(x), Some(y)) if (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) => Some((x, y)),
-            _ => return Err(AppError::bad("A new comment needs a pin position on the image")),
+            (Some(x), Some(y)) if x.is_finite() && y.is_finite() && x.abs() < 1e8 && y.abs() < 1e8 => Some((x, y)),
+            _ => return Err(AppError::bad("A new comment needs a position on the board")),
         },
     };
-
-    let id = state
+    let comment = state
         .db
         .call(move |c| {
-            let tx = c.transaction()?;
-            version_on_board(&tx, input.version_id, board_id)?;
             if let Some(parent) = input.parent_id {
-                let parent_ok = tx
+                let ok = c
                     .query_row(
-                        "SELECT 1 FROM comments WHERE id = ?1 AND version_id = ?2 AND parent_id IS NULL",
-                        params![parent, input.version_id],
+                        "SELECT 1 FROM comments WHERE id = ?1 AND board_id = ?2 AND parent_id IS NULL",
+                        params![parent, board_id],
                         |_| Ok(()),
                     )
                     .optional()?;
-                if parent_ok.is_none() {
+                if ok.is_none() {
                     return Err(AppError::bad("Unknown thread"));
                 }
             }
-            tx.execute(
-                "INSERT INTO comments (version_id, parent_id, x, y, author, is_admin, body, created_at)
+            c.execute(
+                "INSERT INTO comments (board_id, parent_id, x, y, author, is_owner, body, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    input.version_id,
-                    input.parent_id,
-                    pin.map(|p| p.0),
-                    pin.map(|p| p.1),
-                    author,
-                    admin,
-                    body,
-                    now()
-                ],
+                params![board_id, input.parent_id, pin.map(|p| p.0), pin.map(|p| p.1), author, owner, body, now()],
             )?;
-            let id = tx.last_insert_rowid();
-            bump_rev(&tx, board_id)?;
-            tx.commit()?;
-            Ok(id)
+            let comment = load_comment(c, c.last_insert_rowid())?;
+            touch_board(c, board_id)?;
+            Ok(comment)
         })
         .await?;
-    Ok(Json(json!({ "id": id })))
+    state.hub.send(board_id, SERVER, json!({ "t": "comment", "comment": &comment }).to_string());
+    Ok(Json(comment))
 }
 
 #[derive(Deserialize)]
-pub struct StatusBody {
-    status: String,
-    author: Option<String>,
+pub struct ResolveBody {
+    resolved: bool,
 }
 
-pub async fn set_status(
+pub async fn resolve_comment(
     State(state): State<AppState>,
     jar: CookieJar,
-    Path((slug, version_id)): Path<(String, i64)>,
-    Json(input): Json<StatusBody>,
+    Path((slug, id)): Path<(String, i64)>,
+    Json(input): Json<ResolveBody>,
+) -> ApiResult<Json<CommentView>> {
+    let (board_id, role) = authorize(&state, &jar, slug).await?;
+    require(role, Role::Comment)?;
+    let comment = state
+        .db
+        .call(move |c| {
+            let n = c.execute(
+                "UPDATE comments SET resolved_at = ?1 WHERE id = ?2 AND board_id = ?3 AND parent_id IS NULL",
+                params![input.resolved.then(now), id, board_id],
+            )?;
+            if n == 0 {
+                return Err(AppError::NotFound);
+            }
+            load_comment(c, id)
+        })
+        .await?;
+    state.hub.send(board_id, SERVER, json!({ "t": "comment", "comment": &comment }).to_string());
+    Ok(Json(comment))
+}
+
+pub async fn delete_comment(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((slug, id)): Path<(String, i64)>,
 ) -> ApiResult<Json<Value>> {
-    let (board_id, admin) = authorize(&state, &jar, slug).await?;
-    if !STATUSES.contains(&input.status.as_str()) {
-        return Err(AppError::bad("Unknown status"));
-    }
-    let by = match &input.author {
-        Some(a) if !a.trim().is_empty() => Some(clean_text(a, "Name", 60)?),
-        _ if admin => Some("Betch".to_string()),
-        _ => return Err(AppError::bad("Name is required")),
-    };
+    let (board_id, role) = authorize(&state, &jar, slug).await?;
+    require(role, Role::Owner)?;
     state
         .db
         .call(move |c| {
-            let tx = c.transaction()?;
-            version_on_board(&tx, version_id, board_id)?;
-            let (by, at) = if input.status == "pending" { (None, None) } else { (by, Some(now())) };
-            tx.execute(
-                "UPDATE image_versions SET status = ?1, status_by = ?2, status_at = ?3 WHERE id = ?4",
-                params![input.status, by, at, version_id],
-            )?;
-            bump_rev(&tx, board_id)?;
-            tx.commit()?;
-            Ok(())
+            let n = c.execute("DELETE FROM comments WHERE id = ?1 AND board_id = ?2", params![id, board_id])?;
+            if n == 0 { Err(AppError::NotFound) } else { Ok(()) }
         })
         .await?;
+    state.hub.send(board_id, SERVER, json!({ "t": "comment_deleted", "id": id }).to_string());
     Ok(Json(json!({ "ok": true })))
 }
 
-fn version_on_board(conn: &Connection, version_id: i64, board_id: i64) -> Result<(), AppError> {
-    conn.query_row(
-        "SELECT 1 FROM image_versions v JOIN images i ON i.id = v.image_id
-         WHERE v.id = ?1 AND i.board_id = ?2",
-        params![version_id, board_id],
-        |_| Ok(()),
-    )
-    .optional()?
-    .ok_or(AppError::NotFound)
+pub fn multipart_error(e: MultipartError) -> AppError {
+    if e.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::TooLarge
+    } else {
+        AppError::bad(format!("Upload failed: {}", e.body_text()))
+    }
 }

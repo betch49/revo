@@ -2,7 +2,9 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod hub;
 pub mod images;
+pub mod items;
 mod routes;
 
 use std::{path::PathBuf, sync::Arc};
@@ -16,7 +18,7 @@ use axum::{
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::{auth::Throttle, config::Config, db::Db, error::AppError};
+use crate::{auth::Throttle, config::Config, db::Db, error::AppError, hub::Hub};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,13 +26,14 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub images_dir: PathBuf,
     pub throttle: Arc<Throttle>,
+    pub hub: Arc<Hub>,
 }
 
 impl AppState {
     pub fn new(db: Db, config: Config) -> anyhow::Result<Self> {
         let images_dir = config.data_dir.join("images");
         std::fs::create_dir_all(&images_dir)?;
-        Ok(Self { db, config: Arc::new(config), images_dir, throttle: Arc::default() })
+        Ok(Self { db, config: Arc::new(config), images_dir, throttle: Arc::default(), hub: Arc::default() })
     }
 }
 

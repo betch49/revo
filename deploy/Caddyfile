@@ -1,0 +1,8 @@
+# VPS only: Caddy gets and renews the HTTPS certificate automatically.
+review.betch.ch {
+	encode zstd gzip
+	request_body {
+		max_size 70MB
+	}
+	reverse_proxy 127.0.0.1:4000
+}

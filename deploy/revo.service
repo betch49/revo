@@ -1,0 +1,19 @@
+# systemd unit for the review app.
+#  - Infomaniak Cloud Server (user service): ~/.config/systemd/user/revo.service
+#  - VPS (system service):                   /etc/systemd/system/revo.service
+#    add `User=revo` under [Service] and use `WantedBy=multi-user.target`.
+# %h is the home directory of the user running the service.
+
+[Unit]
+Description=Betch review boards (revo)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/revo
+EnvironmentFile=%h/revo/revo.env
+ExecStart=%h/revo/bin/revo serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

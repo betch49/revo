@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Review · Betch</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/static/space-grotesk.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/common.js" defer></script>
+  <script src="/static/board.js" defer></script>
+</head>
+<body class="board-page">
+  <header class="topbar" id="topbar" hidden>
+    <a class="brand" href="https://betch.ch" target="_blank" rel="noopener"><span class="dot"></span>betch</a>
+    <span class="sep hide-mobile"></span>
+    <div class="title" id="board-title"></div>
+    <div class="spacer"></div>
+    <div class="progress-summary hide-mobile" id="summary"></div>
+    <div class="group" id="admin-tools" hidden>
+      <a class="btn ghost hide-mobile" href="/admin" title="Back to all boards">All boards</a>
+      <button type="button" id="btn-edit" title="Move and resize images (A)">Arrange</button>
+      <button type="button" id="btn-upload" class="primary" title="Upload images, or drop files on the board">Upload</button>
+      <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp,image/gif" multiple hidden>
+    </div>
+    <button type="button" id="btn-comment" title="Drop a comment pin on an image (C)">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-12.2 7.5L3 21l2-5.6A8.4 8.4 0 1 1 21 11.5z"/></svg>
+      <span class="hide-mobile">Comment</span>
+    </button>
+    <div class="group hide-mobile">
+      <button type="button" class="icon ghost" id="zoom-out" title="Zoom out (−)">−</button>
+      <span class="zoom-label" id="zoom-label">100%</span>
+      <button type="button" class="icon ghost" id="zoom-in" title="Zoom in (+)">+</button>
+      <button type="button" class="ghost" id="zoom-fit" title="Fit everything (0)">Fit</button>
+    </div>
+  </header>
+
+  <main id="viewport" hidden>
+    <div id="world"></div>
+    <div class="empty-board" id="empty" hidden></div>
+  </main>
+  <aside id="panel" hidden></aside>
+
+  <div class="center-page" id="gate" hidden>
+    <form class="card" id="gate-form">
+      <span class="brand"><span class="dot"></span>betch <small>review</small></span>
+      <h1>This board is protected</h1>
+      <p>Enter the passcode you received with the link.</p>
+      <div class="field">
+        <label for="gate-passcode">Passcode</label>
+        <input type="password" id="gate-passcode" autocomplete="current-password" required>
+        <div class="error-text" id="gate-error"></div>
+      </div>
+      <button type="submit" class="primary">Open board</button>
+    </form>
+  </div>
+
+  <div class="center-page" id="missing" hidden>
+    <div class="card">
+      <span class="brand"><span class="dot"></span>betch <small>review</small></span>
+      <h1>Board not found</h1>
+      <p>Check the link you received, or ask Betch for a new one.</p>
+      <a class="btn" href="https://betch.ch">Go to betch.ch</a>
+    </div>
+  </div>
+</body>
+</html>

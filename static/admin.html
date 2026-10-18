@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Boards · Betch review</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/static/space-grotesk.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/common.js" defer></script>
+  <script src="/static/admin.js" defer></script>
+</head>
+<body>
+  <div class="center-page" id="login" hidden>
+    <form class="card" id="login-form">
+      <span class="brand"><span class="dot"></span>betch <small>review</small></span>
+      <h1>Admin sign in</h1>
+      <p>Manage review boards for your clients.</p>
+      <div class="field">
+        <label for="login-password">Password</label>
+        <input type="password" id="login-password" autocomplete="current-password" required>
+        <div class="error-text" id="login-error"></div>
+      </div>
+      <button type="submit" class="primary">Sign in</button>
+    </form>
+  </div>
+
+  <div class="admin-shell" id="dashboard" hidden>
+    <header class="admin-top">
+      <span class="brand"><span class="dot"></span>betch <small>review</small></span>
+      <span class="spacer"></span>
+      <button type="button" class="ghost" id="logout">Sign out</button>
+    </header>
+    <div class="admin-grid">
+      <form class="card" id="create-form">
+        <h2>New board</h2>
+        <div class="field">
+          <label for="new-title">Client / project</label>
+          <input type="text" id="new-title" maxlength="120" placeholder="e.g. Atelier Lumen — spring lookbook" required>
+        </div>
+        <div class="field">
+          <label for="new-slug">Link</label>
+          <input type="text" id="new-slug" maxlength="64" placeholder="atelier-lumen" required pattern="[a-z0-9][a-z0-9\-]{1,62}[a-z0-9]">
+          <div class="hint" id="slug-preview"></div>
+        </div>
+        <div class="field">
+          <label for="new-passcode">Passcode (optional)</label>
+          <input type="text" id="new-passcode" maxlength="100" autocomplete="off" placeholder="Leave empty for link-only access">
+          <div class="hint">Clients enter it once per browser. You can change it later.</div>
+        </div>
+        <div class="error-text" id="create-error"></div>
+        <button type="submit" class="primary">Create board</button>
+      </form>
+      <section>
+        <div class="boards-head"><h2>Boards</h2><span class="muted small" id="board-count"></span></div>
+        <div class="boards" id="boards"></div>
+      </section>
+    </div>
+  </div>
+</body>
+</html>

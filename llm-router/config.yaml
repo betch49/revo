@@ -1,0 +1,37 @@
+# LiteLLM router: apps call this instead of Ollama directly.
+#
+# Both backends sit in the same model group ("chat") so LiteLLM can put the
+# 4090 into cooldown when the main PC is off. A group with a single backend is
+# never cooled down, so cross-group `fallbacks` would retry the dead PC on
+# every request.
+#
+# `order: 1` = preferred (4090), `order: 2` = used while the 4090 is cooling down.
+
+model_list:
+  - model_name: chat
+    litellm_params:
+      # Ollama's OpenAI-compatible endpoint; set OLLAMA_MODEL to your tag (e.g. qwen3:32b)
+      model: os.environ/OLLAMA_MODEL
+      custom_llm_provider: openai
+      api_base: os.environ/OLLAMA_API_BASE
+      api_key: ollama
+      max_retries: 0    # don't let the client retry a dead PC; the router moves on instead
+      order: 1
+    model_info:
+      id: local-4090
+
+  - model_name: chat
+    litellm_params:
+      model: os.environ/INFOMANIAK_MODEL
+      custom_llm_provider: openai
+      api_base: os.environ/INFOMANIAK_API_BASE
+      api_key: os.environ/INFOMANIAK_AI_TOKEN
+      order: 2
+    model_info:
+      id: infomaniak
+
+router_settings:
+  num_retries: 2      # a failed 4090 call is retried on Infomaniak
+  allowed_fails: 0    # cool the 4090 down on its first failure...
+  cooldown_time: 60   # ...and skip it for 60s, then try it again
+  timeout: 600        # long generations are fine
